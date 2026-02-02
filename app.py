@@ -1,29 +1,153 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, url_for, session, redirect,render_template
 from extensions import db
-from models import Department, Designation, Employee, Project, ProjectEmployee
+from models import Department, Designation, Employee, Project, ProjectEmployee, User
 from datetime import datetime
+from flask_dance.contrib.google import make_google_blueprint, google
+import os
+from dotenv import load_dotenv
+from functools import wraps
+
+load_dotenv()
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///organisation.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.secret_key = os.getenv('FLASK_SECRET_KEY', 'dev_key')
+
+# --- Flask-Dance Setup ---
+os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+os.environ['OAUTHLIB_RELAX_TOKEN_SCOPE'] = '1'
+
+client_id = os.getenv('GOOGLE_CLIENT_ID')
+client_secret = os.getenv('GOOGLE_CLIENT_SECRET')
+
+if client_id:
+    client_id = client_id.strip()
+if client_secret:
+    client_secret = client_secret.strip()
+
+google_bp = make_google_blueprint(
+    client_id=client_id,
+    client_secret=client_secret,
+    scope=[
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "openid"
+    ],
+    redirect_url="/"
+)
+app.register_blueprint(google_bp, url_prefix="/login")
 
 db.init_app(app)
 
 with app.app_context():
     db.create_all()
 
+# --- Decorator ---
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # 1. If not authorized by Google, block immediately
+        if not google.authorized:
+             return jsonify({'error': 'Unauthorized - Please login with Google'}), 401
+
+        # 2. If authorized but we don't know the User ID yet, fetch it
+        if 'user_id' not in session:
+            try:
+                resp = google.get("/oauth2/v2/userinfo")
+                if resp.ok:
+                    user_info = resp.json()
+                    google_id = user_info.get('id') or user_info.get('sub')
+                    
+                    # Find user in DB
+                    user = User.query.filter_by(google_id=google_id).first()
+                    if user:
+                        session['user_id'] = user.id
+                    else:
+                         return jsonify({'error': 'User not registered in database. Please login at home page to create account.'}), 401
+                else:
+                    return jsonify({'error': 'Failed to validate Google token'}), 401
+            except Exception:
+                return jsonify({'error': 'Auth Error'}), 401
+        
+        # 3. Proceed
+        return f(*args, **kwargs)
+    return decorated_function
+
+# --- Auth Helper Routes ---
+@app.route('/logout')
+def logout():
+    session.pop('user_id', None)
+    # Revoke token if desired, or just clear session
+    if google.authorized:
+        try:
+            google.revoke_token()
+        except:
+            pass # Token might be invalid or already revoked
+        del google_bp.token # Clear from blueprint storage
+    session.clear()
+    return jsonify({'message': 'Logged out'})
+
+@app.route('/me')
+@login_required
+def get_current_user():
+    user = User.query.get(session['user_id'])
+    if user:
+        return jsonify(user.to_dict())
+    return jsonify({'error': 'User not found'}), 404
+
 # --- Root Route ---
 @app.route('/', methods=['GET'])
 def home():
-    return jsonify({
-        'message': 'Welcome to the Employee Management API',
-        'endpoints': {
-            'departments': '/departments',
-            'designations': '/designations',
-            'employees': '/employees',
-            'projects': '/projects'
-        }
-    })
+    if not google.authorized:
+        return '''
+            <h1>Employee Management API</h1>
+            <p>Welcome! Please login to test the authentication.</p>
+            <a href="/login/google"><button>Login with Google</button></a>
+        '''
+    
+    # Authorized, fetch info
+    try:
+        resp = google.get("/oauth2/v2/userinfo")
+        if not resp.ok:
+            return f"Failed to fetch user info: {resp.text}", 400
+            
+        user_info = resp.json()#di
+        google_id = user_info.get('id')
+        email = user_info.get('email')
+        name = user_info.get('name')
+        picture = user_info.get('picture')
+        
+        if not google_id:
+             # Fallback if id is not in standard place (though oauth2/v2/userinfo usually has it as 'id')
+             google_id = user_info.get('sub')
+
+        # Sync with DB
+        user = User.query.filter_by(google_id=google_id).first()
+        if not user:
+            user = User(
+                email=email,
+                name=name,
+                google_id=google_id,
+                profile_pic=picture
+            )
+            db.session.add(user)
+            db.session.commit()
+        
+        session['user_id'] = user.id
+        
+        return f'''
+            <h1>Welcome, {user.name}</h1>
+            <p>You are logged in via Google.</p>
+            <p><a href="/logout">Logout</a></p>
+            <p>API Endpoints:</p>
+            <ul>
+                <li><a href="/employees">Employees</a></li>
+                <li><a href="/projects">Projects</a></li>
+            </ul>
+        '''
+    except Exception as e:
+        return f"An error occurred: {str(e)}"
 
 # Error handling
 @app.errorhandler(404)
@@ -40,6 +164,7 @@ def internal_error(error):
 
 # --- Department Routes ---
 @app.route('/departments', methods=['POST'])
+@login_required
 def create_department():
     data = request.json
     if not data or 'name' not in data:
@@ -57,6 +182,7 @@ def get_departments():
 
 # --- Designation Routes ---
 @app.route('/designations', methods=['POST'])
+@login_required
 def create_designation():
     data = request.json
     required = ['class', 'salary', 'department_id']
@@ -79,6 +205,7 @@ def get_designations():
 
 # --- Employee Routes ---
 @app.route('/employees', methods=['POST'])
+@login_required
 def create_employee():
     data = request.json
     required = ['user_id', 'position', 'hire_date', 'department_id', 'designation_id']
@@ -112,6 +239,7 @@ def get_employee(id):
     return jsonify(emp.to_dict())
 
 @app.route('/employees/<int:id>', methods=['PUT'])
+@login_required
 def update_employee(id):
     emp = Employee.query.get_or_404(id)
     data = request.json
@@ -132,6 +260,7 @@ def update_employee(id):
     return jsonify(emp.to_dict())
 
 @app.route('/employees/<int:id>', methods=['DELETE'])
+@login_required
 def delete_employee(id):
     emp = Employee.query.get_or_404(id)
     db.session.delete(emp)
@@ -140,6 +269,7 @@ def delete_employee(id):
 
 # --- Project Routes ---
 @app.route('/projects', methods=['POST'])
+@login_required
 def create_project():
     data = request.json
     if not data or 'name' not in data:
@@ -176,6 +306,7 @@ def get_projects():
     return jsonify([p.to_dict() for p in projects])
 
 @app.route('/projects/<int:id>', methods=['PUT'])
+@login_required
 def update_project(id):
     proj = Project.query.get_or_404(id)
     data = request.json
@@ -199,6 +330,7 @@ def update_project(id):
     return jsonify(proj.to_dict())
 
 @app.route('/projects/<int:id>', methods=['DELETE'])
+@login_required
 def delete_project(id):
     proj = Project.query.get_or_404(id)
     db.session.delete(proj)
@@ -207,6 +339,7 @@ def delete_project(id):
 
 # --- Assignments ---
 @app.route('/projects/<int:project_id>/assign', methods=['POST'])
+@login_required
 def assign_employee(project_id):
     data = request.json
     employee_id = data.get('employee_id')
@@ -228,6 +361,7 @@ def assign_employee(project_id):
     return jsonify(assignment.to_dict()), 201
 
 @app.route('/projects/<int:project_id>/remove/<int:employee_id>', methods=['DELETE'])
+@login_required
 def remove_employee(project_id, employee_id):
     assignment = ProjectEmployee.query.filter_by(project_id=project_id, employee_id=employee_id).first_or_404()
     db.session.delete(assignment)

@@ -1,6 +1,23 @@
 from extensions import db
 from sqlalchemy import func
 
+class User(db.Model):
+    __tablename__ = 'user'
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    name = db.Column(db.Text)
+    google_id = db.Column(db.String(255), unique=True)
+    profile_pic = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, server_default=func.now())
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'email': self.email,
+            'name': self.name,
+            'profile_pic': self.profile_pic
+        }
+
 class Department(db.Model):
     __tablename__ = 'department'
     id = db.Column(db.Integer, primary_key=True)
